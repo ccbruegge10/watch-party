@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- Watch Party player page: a plain full-screen YouTube player (YouTube's own player API).
+     The Watch Party snippet opens this page on its screen as player.html#wpplayer=<video id>
+     and controls it from the world. Host it next to watch-party.js. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watch Party Player</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #p, #p iframe { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; border: 0; }
+    #idle { position: fixed; left: 0; top: 0; right: 0; bottom: 0; display: flex; align-items: center;
+            justify-content: center; color: #8a8a92; font: 42px sans-serif; text-align: center; padding: 0 60px; }
+  </style>
+</head>
+<body>
+  <div id="p"></div>
+  <div id="idle"></div>
+  <script>
+(function () {
+  window.__WP_PLAYER = true;
+  var idle = document.getElementById("idle");
+  var player = null, ready = false, err = 0, cur = null, volNow = null;
+  function hashId() { var x = location.hash.match(/^#wpplayer=([\w-]{11})/); return x ? x[1] : null; }
+  function idleText() { var x = location.hash.match(/[#&]idle=([^&]*)/); return x ? decodeURIComponent(x[1]) : ""; }
+  function load(id) {
+    cur = id; err = 0;
+    idle.style.display = id ? "none" : "flex";
+    idle.textContent = idleText();
+    if (!ready) return;
+    if (id) {
+      if (volNow !== null) try { player.setVolume(Math.round(volNow * 100)); } catch (x) {}   // start at the right volume
+      player.loadVideoById({ videoId: id, suggestedQuality: "hd1080" });
+    } else player.stopVideo();
+  }
+  window.onYouTubeIframeAPIReady = function () {
+    player = new YT.Player("p", {
+      width: "100%", height: "100%",
+      playerVars: { autoplay: 1, controls: 0, disablekb: 1, enablejsapi: 1, fs: 0, iv_load_policy: 3,
+                    modestbranding: 1, playsinline: 1, rel: 0, origin: location.origin, vq: "hd1080" },
+      events: {
+        onReady: function () { ready = true; load(cur); },
+        onError: function (e) { err = e.data || 1; },
+        // ask for 1080p again each time a video starts (YouTube treats it as a request, not an order)
+        onStateChange: function (e) { if (e.data === 1 || e.data === 3) try { player.setPlaybackQuality("hd1080"); } catch (x) {} },
+      },
+    });
+  };
+  window.addEventListener("hashchange", function () { var id = hashId(); if (id !== cur) load(id); else idle.textContent = idleText(); });
+  load(hashId());
+
+  // Controls the world uses
+  window.__bsSeek = function (t) { if (ready && isFinite(t)) player.seekTo(Math.max(0, t), true); };
+  window.__bsSkip = function (s) { if (ready) player.seekTo(Math.max(0, player.getCurrentTime() + s), true); };
+  window.__bsPlay = function (on) { if (!ready) return; if (on) player.playVideo(); else player.pauseVideo(); };
+  // Volume: the world sends a target; the player glides to it (no steps or jumps), and keeps it
+  // there even when YouTube resets the volume for a new video
+  var volTarget = null;
+  window.__bsVol = function (x) { if (isFinite(x)) volTarget = Math.max(0, Math.min(1, x)); };
+  setInterval(function () {
+    if (!ready || volTarget === null) return;
+    if (volNow === null) volNow = volTarget;
+    volNow += (volTarget - volNow) * 0.15;
+    if (Math.abs(volTarget - volNow) < 0.004) volNow = volTarget;
+    var want = Math.round(volNow * 100);
+    try {
+      if (player.getVolume() !== want) player.setVolume(want);
+      if (want > 0 && player.isMuted()) player.unMute();
+    } catch (x) {}
+  }, 50);
+  window.addEventListener("bsmessage", function (e) {     // the same volume, sent as a message as well
+    try { var m = JSON.parse(e.detail.message); if (m && typeof m.wpvol === "number") window.__bsVol(m.wpvol); } catch (x) {}
+  });
+  // Once a second: tell the world what's playing and where it is
+  setInterval(function () {
+    try {
+      if (!window.O || typeof window.O.sendMessage !== "function") return;
+      if (!cur) { window.O.sendMessage("app", JSON.stringify({ from: "wp", player: 1, url: "" })); return; }
+      var st = ready ? player.getPlayerState() : -1, data = ready && player.getVideoData ? player.getVideoData() : {};
+      var d = ready ? player.getDuration() : null;
+      window.O.sendMessage("app", JSON.stringify({
+        from: "wp", player: 1, url: "https://www.youtube.com/embed/" + cur, title: (data && data.title) || "",
+        t: ready ? player.getCurrentTime() : null, d: d || null, live: !!(data && data.isLive),
+        paused: ready ? !(st === 1 || st === 3) : null, ended: st === 0, err: !!err, ad: false,
+        q: ready && player.getPlaybackQuality ? player.getPlaybackQuality() : "", w: window.innerWidth, h: window.innerHeight,
+      }));
+    } catch (e) {}
+  }, 1000);
+
+  var s = document.createElement("script");
+  s.src = "https://www.youtube.com/iframe_api";
+  document.head.appendChild(s);
+})();
+  </script>
+</body>
+</html>
