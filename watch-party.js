@@ -41,7 +41,7 @@
     fullVolumeWithin: fullAt, silentBeyond: Math.max(fullAt + 0.5, num("silence-distance", 12, 0, 1000)), fadeCurve: 2,
     distanceVolume: bool("distance-volume", true),
     showDistance: bool("debug", false),
-    maxQueue: num("max-items", 20, 1, 50),
+    maxQueue: num("max-items", 50, 1, 100),
     searchResults: 12,
   };
   // Colours (the snippet's palette)
@@ -104,6 +104,20 @@
     "live:!v.lengthText&&/LIVE/.test(JSON.stringify(v.badges||[])+JSON.stringify(v.thumbnailOverlays||[]))});return;}" +
     "for(var k in o)walk(o[k],d+1);}walk(window.ytInitialData,0);" +
     "window.O.sendMessage('app',JSON.stringify({from:'wpq',q:q,items:out}));window.__bsScr=true;})();";
+
+  // Put into the hidden page for a playlist: reads the playlist's videos and sends them to the world
+  const PLAYLIST_READ =
+    "(function(){if(window.__bsPl)return;var l=new URLSearchParams(location.search).get('list');" +
+    "if(!l||!window.ytInitialData||!window.O||typeof window.O.sendMessage!=='function')return;" +
+    "var out=[],seen={},title='';function txt(t){return t?(t.simpleText||t.content||(t.runs||[]).map(function(r){return r.text;}).join('')):'';}" +
+    "function walk(o,d){if(!o||typeof o!=='object'||out.length>=200||d>60)return;" +
+    "var v=o.playlistVideoRenderer||o.playlistPanelVideoRenderer;" +
+    "if(v&&v.videoId){if(!seen[v.videoId]){seen[v.videoId]=1;out.push({id:v.videoId,title:txt(v.title),d:txt(v.lengthText)});}return;}" +
+    "if(!title&&o.playlistHeaderRenderer)title=txt(o.playlistHeaderRenderer.title);" +
+    "if(!title&&o.playlist&&o.playlist.title&&typeof o.playlist.title!=='string')title=txt(o.playlist.title);" +
+    "for(var k in o)walk(o[k],d+1);}walk(window.ytInitialData,0);" +
+    "if(!title)title=document.title.replace(/ - YouTube$/,'');" +
+    "window.O.sendMessage('app',JSON.stringify({from:'wpl',list:l,title:title,items:out}));window.__bsPl=true;})();";
 
   // Two addresses for the same thing (YouTube adds bits to its addresses after a video loads)
   const norm = (u) => {
@@ -225,10 +239,14 @@
     //   2. otherwise the world's owner, while they're here
     //   3. otherwise whoever has been here longest, then the next longest, and so on
     const here = (uid) => !!(uid && (scene.users || {})[uid]);
+    const presentWhenIArrived = new Set();
     const placeInLine = (uid) => {
       if (uid === me()) return myStampWritten ? joins[uid] : Infinity;
       const t = joins[uid];
-      return t && t !== staleJoin[uid] ? t : Infinity;
+      if (t && t !== staleJoin[uid]) return t;
+      // No arrival time from them (yet): anyone who was already here before me counts as ahead of me,
+      // so a newcomer never jumps the line just because a message hasn't reached them
+      return !myStampWritten || presentWhenIArrived.has(uid) ? 0 : Infinity;
     };
     function recompute() {
       const users = scene.users || {};
@@ -243,6 +261,7 @@
     }
     // Arriving: take my place at the back of the line, once I've seen everyone else's places
     setTimeout(() => {
+      for (const uid of Object.keys(scene.users || {})) if (uid !== me()) presentWhenIArrived.add(uid);
       let latest = Date.now();
       for (const uid in joins) if (uid !== me() && here(uid) && placeInLine(uid) !== Infinity) latest = Math.max(latest, joins[uid] + 1);
       joins[me()] = latest; myStampWritten = true;
@@ -259,11 +278,28 @@
       waitingUrl = null;
       share({ [K.join + me()]: String(latest) });
       if (override === me()) share({ [K.host]: "" });          // left over from an earlier visit
-      // If I own the world, say so (only the owner is allowed to write this one)
-      try { scene.SetProtectedSpaceProps({ [K.owner]: me() }); } catch (err) {}
-      try { scene.OneShot({ wp: WP.key, owner: me() }); } catch (err) {}
+      findOwner();
       recompute();
     }, 3000);
+    // Who owns the world. Only the owner can save the world's own files, so the owner's page saves its
+    // id in one and everyone reads it from there (it's there even while the owner is away). The owner
+    // also says so in a message the server marks as coming from the owner.
+    const OWNER_FILE = "watchparty_owner";
+    async function findOwner() {
+      const P = BS.PersistFileBridge;
+      if (!P) return;
+      let saved = null;
+      try { const t = await P.get(scene, OWNER_FILE); saved = t ? JSON.parse(t) : null; } catch (err) {}
+      if (saved && typeof saved.uid === "string" && !ownerUid) { ownerUid = saved.uid; recompute(); }
+      try {
+        const info = await P.info(scene);
+        if (!info || !info.canWrite) return;            // not the owner (or not signed in)
+        ownerUid = me();
+        iAmOwner();
+        if (!saved || saved.uid !== me()) P.set(scene, OWNER_FILE, JSON.stringify({ uid: me() })).catch(() => {});
+        try { scene.OneShot({ wp: WP.key, owner: me() }); } catch (err) {}
+      } catch (err) {}
+    }
     function iAmOwner() {
       if (ownerClaimed) return;
       ownerClaimed = true;
@@ -307,7 +343,13 @@
     }
 
     // ---------- Queue ----------
-    function saveQueue() { share({ [K.queue]: encodeURIComponent(JSON.stringify(queue)) }); refreshUi(); }
+    // The queue is stored short (YouTube videos as just their id) so a long playlist still fits
+    const packQueue = (q) => q.map((x) => { const id = ytId(x.url); const o = { u: id ? "y:" + id : x.url, t: x.title || "" };
+                                            if (x.d) o.d = x.d; if (x.live) o.l = 1; return o; });
+    const unpackQueue = (q) => (Array.isArray(q) ? q : []).map((x) => x && x.u
+      ? { url: /^y:/.test(x.u) ? embedUrl(x.u.slice(2)) : x.u, title: x.t || "", d: x.d || "", live: !!x.l }
+      : x).filter((x) => x && x.url);
+    function saveQueue() { share({ [K.queue]: encodeURIComponent(JSON.stringify(packQueue(queue))) }); refreshUi(); }
     function enqueue(item) {
       if (blocked()) return false;
       if (queue.some((q) => sameUrl(q.url, item.url))) { say("Already in the queue"); return false; }
@@ -330,6 +372,27 @@
       const t = queue[i]; queue[i] = queue[j]; queue[j] = t;
       saveQueue();
     }
+    // A whole YouTube playlist: Play all = replace the queue and start the first; Add all = add to the end
+    function importPlaylist(items, playNow) {
+      if (blocked() || !items.length) return;
+      const fresh = items.filter((it) => !sameUrl(it.url, currentUrl));
+      if (playNow) {
+        const [first, ...rest] = items;
+        queue = rest.slice(0, WP.maxQueue).map((it) => ({ url: it.url, title: cut(it.title, 70), d: it.d || "", live: !!it.live }));
+        saveQueue();
+        play(first.url);
+        say("Playing the playlist" + (items.length - 1 > WP.maxQueue ? " (first " + (WP.maxQueue + 1) + " videos)" : ""));
+      } else {
+        let added = 0;
+        for (const it of fresh) {
+          if (queue.length >= WP.maxQueue) break;
+          if (queue.some((q) => sameUrl(q.url, it.url))) continue;
+          queue.push({ url: it.url, title: cut(it.title, 70), d: it.d || "", live: !!it.live }); added++;
+        }
+        saveQueue();
+        say("Added " + added + " of " + items.length + (added < fresh.length ? " (the queue is full)" : ""));
+      }
+    }
     function queueRemove(i) { if (blocked()) return; queue.splice(i, 1); saveQueue(); }
     function queuePlay(i) { if (blocked()) return; const it = queue.splice(i, 1)[0]; saveQueue(); if (it) play(it.url); }
 
@@ -340,8 +403,17 @@
     async function runSearch(text) {
       text = (text || "").trim();
       if (!text) return;
+      playlist = null;
       if (looksLikeAddress(text)) {                  // a link: offer it as the one result
         let url = /^https?:\/\//i.test(text) ? text : "https://" + text;
+        let listId = null;
+        try { const u = new URL(url); listId = /youtube\.com$|youtu\.be$/.test(u.hostname.replace(/^(www|m|music)\./, "")) ? u.searchParams.get("list") : null; } catch (err) {}
+        if (listId && /^[\w-]{10,}$/.test(listId)) {   // a playlist: read its videos
+          const v = ytId(url);
+          const page = /^RD/.test(listId) && v ? "https://www.youtube.com/watch?v=" + v + "&list=" + listId   // a "Mix" only exists on a video page
+                                               : "https://www.youtube.com/playlist?list=" + listId;
+          return readPage(page, "list", listId);
+        }
         const id = ytId(url);
         const item = { url: id ? embedUrl(id) : url, title: id ? "" : url, d: "" };
         results = [item]; searchState = "done"; refreshUi();
@@ -352,21 +424,31 @@
         }).catch(() => {});
         return;
       }
-      searchQuery = text; results = []; searchState = "searching"; pages.search = 0; refreshUi();
-      const url = "https://www.youtube.com/results?search_query=" + encodeURIComponent(text) + "&sp=EgIQAQ%253D%253D";
+      return readPage("https://www.youtube.com/results?search_query=" + encodeURIComponent(text) + "&sp=EgIQAQ%253D%253D", "search", text);
+    }
+    // The hidden page that reads YouTube's results (a search, or a playlist's videos)
+    let readKind = "search", playlist = null;
+    async function readPage(url, kind, query) {
+      searchQuery = query; readKind = kind; results = []; searchState = "searching"; pages.search = 0; refreshUi();
       if (!searchObj) {
         searchObj = new BS.GameObject({ name: "WatchPartySearchReader", localScale: new BS.Vector3(0.01, 0.01, 0.01), ...searchParent });
         searchBrowser = await searchObj.AddComponent(new BS.Browser({ url, pageWidth: 800, pageHeight: 600 }));
         searchObj.On("browser-message", (e) => {
           let m; try { m = JSON.parse(e.detail); } catch (err) { return; }
-          if (!m || m.from !== "wpq" || m.q !== searchQuery || searchState !== "searching") return;
-          results = (m.items || []).map((x) => ({ url: embedUrl(x.id), title: x.title, d: x.live ? "" : x.d, live: !!x.live }));
+          if (!m || searchState !== "searching") return;
+          if (m.from === "wpq" && readKind === "search" && m.q === searchQuery)
+            results = (m.items || []).map((x) => ({ url: embedUrl(x.id), title: x.title, d: x.live ? "" : x.d, live: !!x.live }));
+          else if (m.from === "wpl" && readKind === "list" && m.list === searchQuery) {
+            results = (m.items || []).map((x) => ({ url: embedUrl(x.id), title: x.title, d: x.d || "" }));
+            playlist = { title: m.title || "Playlist", count: results.length };
+          } else return;
           searchState = results.length ? "done" : "none";
           closeReader();
           refreshUi();
         });
         readerTimer = setInterval(() => {
-          if (searchState === "searching" && searchBrowser) searchBrowser.RunActions(JSON.stringify({ actions: [{ actionType: "runscript", strParam1: SEARCH_READ }] }));
+          if (searchState === "searching" && searchBrowser)
+            searchBrowser.RunActions(JSON.stringify({ actions: [{ actionType: "runscript", strParam1: readKind === "list" ? PLAYLIST_READ : SEARCH_READ }] }));
         }, 700);
       } else searchBrowser.url = url;
       clearTimeout(searchTimer);
@@ -391,12 +473,12 @@
         }
         else if (ch.property === K.host) { override = v || ""; recompute(); }
         else if (ch.property === K.lock) { lockUid = v && v !== "0" && v !== "1" ? v : ""; recompute(); }
-        else if (ch.property === K.owner) { ownerUid = v || ""; if (ownerUid && ownerUid === me()) iAmOwner(); recompute(); }
+        // (an older version kept the owner in K.owner; that value isn't trusted any more)
         else if (ch.property && ch.property.indexOf(K.join) === 0) {
           const uid = ch.property.slice(K.join.length), t = Number(v);
           if (uid !== me() || myStampWritten) { joins[uid] = t; recompute(); }
         }
-        else if (ch.property === K.queue) { queue = parseList(v); refreshUi(); }
+        else if (ch.property === K.queue) { queue = unpackQueue(parseList(v)); refreshUi(); }
         else if (ch.property === K.hist) { hist = parseList(v); }
       }
     });
@@ -732,16 +814,25 @@
         pager("queue", queue.length, 4);
       }
       function renderSearch() {
-        const status = searchState === "searching" ? "Searching…" : searchState === "none" ? "No results" : "";
+        const status = searchState === "searching" ? (readKind === "list" ? "Reading the playlist…" : "Searching…")
+                     : searchState === "none" ? (readKind === "list" ? "Couldn't read that playlist (it may be private)" : "No results") : "";
         if (Date.now() < sayUntil || status) top_(text(pui, body, Date.now() < sayUntil ? sayText : status, { fontSize: 18, color: C.dim, marginBottom: 6 }));
         if (!results.length) { if (!status) empty("Type what you're looking for, then press Search."); return; }
+        if (playlist && readKind === "list") {          // the playlist banner: play or add the lot
+          const bn = top_(box(pui, body, { flexDirection: "row", alignItems: "center", backgroundColor: C.activeRow, borderRadius: 12,
+            borderWidth: 2, borderColor: C.accent, paddingLeft: 14, paddingRight: 8, height: 64, marginBottom: 8 }));
+          text(pui, bn, cut(playlist.title, 40) + "  ·  " + playlist.count + " videos", { fontSize: 20, fontWeight: "bold", flexGrow: 1, flexShrink: 1 });
+          btn(pui, bn, "Add all", { height: 48, fontSize: 20 }, () => importPlaylist(results, false));
+          btn(pui, bn, "Play all", { height: 48, fontSize: 20, backgroundColor: C.accent }, () => importPlaylist(results, true));
+        }
         const list = top_(box(pui, body, { flexDirection: "column", flexGrow: 1 }));
-        const start = pages.search * 4;
-        results.slice(start, start + 4).forEach((it) => {
+        const per = playlist && readKind === "list" ? 3 : 4;
+        const start = pages.search * per;
+        results.slice(start, start + per).forEach((it) => {
           const playing = currentUrl && sameUrl(it.url, currentUrl);
           itemRow(list, 0, it, playing, [["Add", () => enqueue(it)], ["Play", () => play(it.url), true]]);
         });
-        pager("search", results.length, 4);
+        pager("search", results.length, per);
       }
       function renderPeople() {
         const r1 = top_(box(pui, body, { flexDirection: "row", alignItems: "center", marginBottom: 14 }));
