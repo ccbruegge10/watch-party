@@ -14,7 +14,9 @@
  */
 (() => {
   // ---------- Settings (read from the <bs-snippet name="watch-party"> element) ----------
-  const EL = document.querySelector('bs-snippet[name="watch-party"]');
+  // Find my element: by name, or (whatever slug it was added under in Unity) by the script it loads
+  const EL = document.querySelector('bs-snippet[name="watch-party"]') ||
+    [...document.querySelectorAll('bs-snippet')].find((e) => /watch-party(\.min)?\.js(\?|$)/.test(e.getAttribute('script') || ''));
   if (!EL) { console.warn("[Watch party] no <bs-snippet name=\"watch-party\"> on the page"); return; }
   const attr = (n, d) => { const v = EL.getAttribute(n); return v === null || v === "" ? d : v; };
   const num = (n, d, lo, hi) => { const v = parseFloat(attr(n, "")); return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; };
@@ -27,6 +29,7 @@
     fallback: POS,
     idleText: String(attr("idle-text", "Open Playlist and pick something to watch")).slice(0, 120),
     skipAds: bool("skip-ads", true),
+    youtubePageFallback: bool("allow-youtube-page", false),   // false = skip videos that block outside play (no ads)
     pageW: 1920, pageH: 1080,
     idleW: 480, idleH: 270,
     scale: WIDTH / (1920 / 1300),
@@ -160,7 +163,7 @@
     let override = "", lockUid = "", ownerUid = "", joinedAt = Date.now(), myStampWritten = false, ownerClaimed = false;
     const joins = {};          // uid -> when they arrived (their place in line for host)
     const staleJoin = {};      // uid -> an old arrival time left over from an earlier visit (ignored)
-    let lastQ = "";
+    let lastQ = "", blockedHandled = null;
     let master = null, page = null, lastSent = 0, quietUntil = 0, lastEndedUrl = null;
     let refreshUi = () => {}, refreshLabel = () => {};
     const isHost = () => host === me();
@@ -372,6 +375,25 @@
       const t = queue[i]; queue[i] = queue[j]; queue[j] = t;
       saveQueue();
     }
+    // Titles and lengths for videos we only know by id (a playlist read through YouTube's player)
+    let titleRun = 0;
+    async function fillTitles(items, onDone) {
+      if (!scene.YtInfo) return;
+      const run = ++titleRun;
+      for (const it of items.slice(0, 100)) {
+        if (run !== titleRun && !onDone) return;              // a newer search replaced these results
+        if (it.title) continue;
+        const id = ytId(it.url);
+        if (!id) continue;
+        try {
+          const info = await scene.YtInfo(id);
+          const v = info && info.videoDetails;
+          if (v) { it.title = v.title || ""; if (!it.d && Number(v.lengthSeconds)) it.d = fmt(Number(v.lengthSeconds)); }
+        } catch (err) {}
+        refreshUi();
+      }
+      if (onDone) onDone();
+    }
     // A whole YouTube playlist: Play all = replace the queue and start the first; Add all = add to the end
     function importPlaylist(items, playNow) {
       if (blocked() || !items.length) return;
@@ -381,6 +403,7 @@
         queue = rest.slice(0, WP.maxQueue).map((it) => ({ url: it.url, title: cut(it.title, 70), d: it.d || "", live: !!it.live }));
         saveQueue();
         play(first.url);
+        if (queue.some((q) => !q.title)) fillTitles(queue, () => saveQueue());
         say("Playing the playlist" + (items.length - 1 > WP.maxQueue ? " (first " + (WP.maxQueue + 1) + " videos)" : ""));
       } else {
         let added = 0;
@@ -390,6 +413,7 @@
           queue.push({ url: it.url, title: cut(it.title, 70), d: it.d || "", live: !!it.live }); added++;
         }
         saveQueue();
+        if (queue.some((q) => !q.title)) fillTitles(queue, () => saveQueue());
         say("Added " + added + " of " + items.length + (added < fresh.length ? " (the queue is full)" : ""));
       }
     }
@@ -412,7 +436,7 @@
           const v = ytId(url);
           const page = /^RD/.test(listId) && v ? "https://www.youtube.com/watch?v=" + v + "&list=" + listId   // a "Mix" only exists on a video page
                                                : "https://www.youtube.com/playlist?list=" + listId;
-          return readPage(page, "list", listId);
+          return readPage(PLAYER_BASE && !playerBroken ? PLAYER_BASE + "#wplist=" + listId : page, "list", listId);
         }
         const id = ytId(url);
         const item = { url: id ? embedUrl(id) : url, title: id ? "" : url, d: "" };
@@ -439,8 +463,10 @@
           if (m.from === "wpq" && readKind === "search" && m.q === searchQuery)
             results = (m.items || []).map((x) => ({ url: embedUrl(x.id), title: x.title, d: x.live ? "" : x.d, live: !!x.live }));
           else if (m.from === "wpl" && readKind === "list" && m.list === searchQuery) {
-            results = (m.items || []).map((x) => ({ url: embedUrl(x.id), title: x.title, d: x.d || "" }));
-            playlist = { title: m.title || "Playlist", count: results.length };
+            results = (m.items || []).filter((x) => x && /^[\w-]{11}$/.test(x.id))
+              .map((x) => ({ url: embedUrl(x.id), title: x.title || "", d: x.d || "" }));
+            playlist = { title: m.title || "YouTube playlist", count: results.length };
+            fillTitles(results);
           } else return;
           searchState = results.length ? "done" : "none";
           closeReader();
@@ -512,6 +538,16 @@
                paused: m.paused, ad: !!m.ad, at: now };
       // The embed player refused this video (some can't be embedded): use the normal YouTube page on this screen
       const id = ytId(currentUrl);
+      if (m.err && id && isEmbed(currentUrl) && !noEmbed.has(id) && !WP.youtubePageFallback) {
+        // Its owner doesn't allow it to play outside YouTube. Skip it rather than open YouTube's own page,
+        // which is where ads come from.
+        if (blockedHandled !== currentUrl) {
+          blockedHandled = currentUrl;
+          say("Skipped a video that can only play on YouTube itself");
+          if (isHost()) { if (queue.length) playNext(); else { showUrl(IDLE); share({ [K.url]: encodeURIComponent(IDLE) }); } }
+        }
+        return;
+      }
       if (m.err && id && isEmbed(currentUrl) && !noEmbed.has(id)) {
         noEmbed.add(id);
         console.log("[Watch party] " + id + " won't play embedded; using the YouTube page");

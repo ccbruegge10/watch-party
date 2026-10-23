@@ -21,6 +21,37 @@
 (function () {
   window.__WP_PLAYER = true;
   var idle = document.getElementById("idle");
+  // Playlist reader (#wplist=<id>): a hidden copy of this page asks YouTube's own player for a
+  // playlist's videos and sends their ids to the world. Nothing plays.
+  var listMatch = location.hash.match(/^#wplist=([\w-]{10,})/);
+  if (listMatch) {
+    var listId = listMatch[1], sent = false, lp = null;
+    var sendList = function (ids) {
+      if (sent || !window.O || typeof window.O.sendMessage !== "function") return;
+      sent = true;
+      window.O.sendMessage("app", JSON.stringify({ from: "wpl", list: listId, title: "", items: ids.map(function (i) { return { id: i }; }) }));
+    };
+    var tryList = function () {
+      try { var ids = lp && lp.getPlaylist && lp.getPlaylist(); if (ids && ids.length) sendList(ids); } catch (x) {}
+      return sent;
+    };
+    window.onYouTubeIframeAPIReady = function () {
+      lp = new YT.Player("p", {
+        width: "320", height: "180",
+        playerVars: { listType: "playlist", list: listId, autoplay: 0, controls: 0, mute: 1, origin: location.origin },
+        events: {
+          onReady: function () { try { lp.mute(); lp.cuePlaylist({ listType: "playlist", list: listId }); } catch (x) {} },
+          onStateChange: function () { tryList(); },
+        },
+      });
+    };
+    var tries = 0, timer = setInterval(function () { if (tryList() || ++tries > 40) clearInterval(timer); }, 500);
+    setTimeout(function () { if (!sent) sendList([]); }, 21000);   // couldn't read it (private, or not a real playlist)
+    var api = document.createElement("script");
+    api.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(api);
+    return;
+  }
   var player = null, ready = false, err = 0, cur = null, volNow = null;
   function hashId() { var x = location.hash.match(/^#wpplayer=([\w-]{11})/); return x ? x[1] : null; }
   function idleText() { var x = location.hash.match(/[#&]idle=([^&]*)/); return x ? decodeURIComponent(x[1]) : ""; }
