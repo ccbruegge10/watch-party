@@ -190,24 +190,28 @@
       }
       return url;
     }
-    // If the built-in player page never answers on this computer (some platforms can't open it),
-    // this screen goes back to opening YouTube's embed page directly. Only affects this player.
-    let playerBroken = false, playerOk = false, playerOpenedAt = 0;
+    // If the player page never answers on this computer (some platforms can't open it), this screen
+    // goes back to opening YouTube's embed page directly (which can show more ads). Only affects this
+    // player. The clock only runs while a video is open in the player page (not while the world is still
+    // loading), it allows 40 s, and the next video tries the player page again (up to 3 times a visit).
+    let playerBroken = false, playerOk = false, playerOpenedAt = 0, brokenCount = 0;
     setInterval(() => {
-      if (!PLAYER_BASE || playerBroken || playerOk || !playerOpenedAt || Date.now() - playerOpenedAt < 15000) return;
-      playerBroken = true;
-      console.log("[Watch party] the built-in player page didn't load here; using YouTube's embed page instead");
+      if (!PLAYER_BASE || playerBroken || playerOk || !playerOpenedAt || Date.now() - playerOpenedAt < 40000) return;
+      playerBroken = true; brokenCount++; playerOpenedAt = 0;
+      console.log("[Watch party] the player page didn't answer; using YouTube's embed page for now (" + brokenCount + ")");
       if (currentUrl) showUrl(currentUrl, true);
+      refreshUi();
     }, 2000);
     function showUrl(url, force) {                // this player's screen only
       if (!url) return;
       url = screenUrlFor(url);
       if (!force && (url === currentUrl || sameUrl(url, currentUrl))) return;
+      if (!force && playerBroken && !playerOk && brokenCount < 3 && ytId(url)) playerBroken = false;   // a new video: try the player page again
       currentUrl = url;
       page = null;
       settleUntil = Date.now() + 6000;
       const pageUrl = pageFor(url);
-      if (PLAYER_BASE && !playerOk && pageUrl.indexOf(PLAYER_BASE) === 0 && !playerOpenedAt) playerOpenedAt = Date.now();
+      if (PLAYER_BASE && !playerOk && pageUrl.indexOf(PLAYER_BASE) === 0) playerOpenedAt = isIdle(url) ? 0 : Date.now();
       setPageSize(url);
       if (browser) browser.url = pageUrl; else pendingUrl = pageUrl;
       refreshUi();
@@ -606,7 +610,6 @@
       const screen = new BS.GameObject({ name: "WatchPartyScreen", localScale: new BS.Vector3(WP.scale, WP.scale, 1), ...at(0, 0, 0) });
       if (!currentUrl) currentUrl = IDLE;
       browser = await screen.AddComponent(new BS.Browser({ url: pendingUrl || pageFor(currentUrl), pageWidth: WP.pageW, pageHeight: WP.pageH }));
-      if (PLAYER_BASE && !playerOpenedAt) playerOpenedAt = Date.now();
       setPageSize(currentUrl);
       const inject = () => browser.RunActions(JSON.stringify({ actions: [{ actionType: "runscript", strParam1: PAGE_WATCH }] }));
       setTimeout(inject, 2000); setInterval(inject, 2000);
@@ -906,6 +909,7 @@
         const s = [];
         if (isHost()) s.push("You host"); else if (hostHere()) s.push("Host: " + nameOf(host)); else s.push("No host");
         if (locked) s.push("Locked");
+        if (playerBroken && ytId(currentUrl || "")) s.push("Basic player: ads possible");
         if (page && page.d === Infinity) s.push("LIVE");
         if (WP.showDistance) s.push((lastDist === null ? (screenPos ? "no head position yet" : "screen position unknown") : lastDist.toFixed(1) + " m") +
           " · vol " + (muted ? 0 : Math.round(myVolume * distanceFactor * 100)) + "%");
